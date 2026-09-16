@@ -106,7 +106,7 @@ export const generateStudyMaterial = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => lessonInput.parse(input))
   .handler(async ({ data }) => {
     const prompt = `Return JSON for a study lesson titled "${data.title}". The JSON must have summary (string), concepts (array of individual sub-topics with title, explanation in plain language, one real-life example, recallQuestion), and flashcards (array with front and back). Generate 3 to 5 flashcards. Do not rewrite the source as one long summary. Source:\n\n${data.sourceText}`;
-    return normalizePayload(await callStructuredAi(prompt));
+    return normalizePayload(await callStructuredAi(prompt, lessonSchema));
   });
 
 export const regenerateConcept = createServerFn({ method: "POST" })
@@ -124,6 +124,7 @@ export const regenerateConcept = createServerFn({ method: "POST" })
       : "Replace only the real-life example with a different concrete example. Keep the explanation and recall question unchanged.";
     const result = z.object({ explanation: z.string(), example: z.string() }).parse(await callStructuredAi(
       `Return JSON with explanation and example. Lesson: ${topic.title}. Concept: ${concept.title}. Current explanation: ${concept.explanation}. Current example: ${concept.example}. ${request}`,
+      conceptSchema,
     ));
     const updated: StudyPayload = {
       ...payload,
