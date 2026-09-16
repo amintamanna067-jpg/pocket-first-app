@@ -1,6 +1,7 @@
 export type StudyConcept = {
   key: string;
   title: string;
+  anchor: string;
   explanation: string;
   example: string;
   recallQuestion: string;
