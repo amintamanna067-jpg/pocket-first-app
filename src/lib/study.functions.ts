@@ -14,54 +14,74 @@ const conceptInput = z.object({
   action: z.enum(["explain", "example"]),
 });
 
-async function callStructuredAi(prompt: string) {
-  const apiKey = process.env["LOVABLE_API_KEY"];
-  if (!apiKey) throw new Error("AI is not configured for this app.");
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Lovable-API-Key": apiKey,
-      "X-Lovable-AIG-SDK": "fetch",
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
+
+type JsonSchema = Record<string, unknown>;
+
+const lessonSchema: JsonSchema = {
+  type: "object",
+  properties: {
+    summary: { type: "string" },
+    concepts: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          explanation: { type: "string" },
+          example: { type: "string" },
+          recallQuestion: { type: "string" },
+        },
+        required: ["title", "explanation", "example", "recallQuestion"],
+      },
     },
-    body: JSON.stringify({
-      model: "openai/gpt-6-astra",
-      input: prompt,
-      stream: true,
-      reasoning: { effort: "low", summary: "auto" },
-      text: { format: { type: "json_object" } },
-    }),
-  });
+    flashcards: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { front: { type: "string" }, back: { type: "string" } },
+        required: ["front", "back"],
+      },
+    },
+  },
+  required: ["summary", "concepts", "flashcards"],
+};
+
+const conceptSchema: JsonSchema = {
+  type: "object",
+  properties: { explanation: { type: "string" }, example: { type: "string" } },
+  required: ["explanation", "example"],
+};
+
+async function callStructuredAi(prompt: string, schema: JsonSchema) {
+  const apiKey = process.env["GEMINI_API_KEY"];
+  if (!apiKey) throw new Error("Gemini is not configured for this app. Add the GEMINI_API_KEY secret.");
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: schema,
+        },
+      }),
+    },
+  );
   if (!response.ok) {
     const message = await response.text();
-    throw new Error(message || `AI request failed (${response.status}).`);
+    throw new Error(message || `Gemini request failed (${response.status}).`);
   }
-  if (!response.body) throw new Error("AI returned no response.");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let output = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
-    for (const event of events) {
-      for (const line of event.split("\n")) {
-        if (!line.startsWith("data: ")) continue;
-        const raw = line.slice(6);
-        if (raw === "[DONE]") continue;
-        try {
-          const data = JSON.parse(raw) as { type?: string; delta?: string };
-          if (data.type === "response.output_text.delta" && data.delta) output += data.delta;
-        } catch {
-          // Incomplete/non-JSON SSE lines are ignored.
-        }
-      }
-    }
-  }
-  if (!output) throw new Error("AI completed without usable study content.");
+  const result = (await response.json()) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+  const output = result.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
+  if (!output) throw new Error("Gemini completed without usable study content.");
   return JSON.parse(output) as unknown;
 }
 
