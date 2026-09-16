@@ -28,11 +28,12 @@ const lessonSchema: JsonSchema = {
         type: "object",
         properties: {
           title: { type: "string" },
+          anchor: { type: "string" },
           explanation: { type: "string" },
           example: { type: "string" },
           recallQuestion: { type: "string" },
         },
-        required: ["title", "explanation", "example", "recallQuestion"],
+        required: ["title", "anchor", "explanation", "example", "recallQuestion"],
       },
     },
     flashcards: {
@@ -49,8 +50,12 @@ const lessonSchema: JsonSchema = {
 
 const conceptSchema: JsonSchema = {
   type: "object",
-  properties: { explanation: { type: "string" }, example: { type: "string" } },
-  required: ["explanation", "example"],
+  properties: {
+    anchor: { type: "string" },
+    explanation: { type: "string" },
+    example: { type: "string" },
+  },
+  required: ["anchor", "explanation", "example"],
 };
 
 async function callStructuredAi(prompt: string, schema: JsonSchema) {
@@ -89,7 +94,7 @@ function normalizePayload(value: unknown): StudyPayload {
   const parsed = z.object({
     summary: z.string(),
     concepts: z.array(z.object({
-      title: z.string(), explanation: z.string(), example: z.string(), recallQuestion: z.string(),
+      title: z.string(), anchor: z.string(), explanation: z.string(), example: z.string(), recallQuestion: z.string(),
     })),
     flashcards: z.array(z.object({ front: z.string(), back: z.string() })),
   }).parse(value);
@@ -105,7 +110,7 @@ export const generateStudyMaterial = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => lessonInput.parse(input))
   .handler(async ({ data }) => {
-    const prompt = `Return JSON for a study lesson titled "${data.title}". The JSON must have summary (string), concepts (array of individual sub-topics with title, explanation in plain language, one real-life example, recallQuestion), and flashcards (array with front and back). Generate 3 to 5 flashcards. Do not rewrite the source as one long summary. Source:\n\n${data.sourceText}`;
+    const prompt = `Return JSON for a study lesson titled "${data.title}". The JSON must have summary (string), concepts (array of individual sub-topics with title, anchor, explanation, one real-life example, recallQuestion), and flashcards (array with front and back). For each concept, first identify the single most essential sentence or short passage from the source material—the core definition or key example—and return it as anchor. Build that concept's explanation from that anchor point only, not from the full surrounding paragraph. If the source has multiple numbered sub-points under a heading (for example, "1. Technological Advancements" and "2. Market Competition"), return every numbered sub-point as its own separate concept; never merge them into one concept. Use very simple, everyday language, short sentences, no jargon. If a technical term is unavoidable, define it in plain words immediately after. Generate 3 to 5 flashcards. Do not rewrite the source as one long summary. Source:\n\n${data.sourceText}`;
     return normalizePayload(await callStructuredAi(prompt, lessonSchema));
   });
 
@@ -114,16 +119,16 @@ export const regenerateConcept = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => conceptInput.parse(input))
   .handler(async ({ data, context }) => {
     const { data: topic, error } = await context.supabase
-      .from("topics").select("generated_payload,title").eq("id", data.topicId).single();
+      .from("topics").select("generated_payload,title,source_text").eq("id", data.topicId).single();
     if (error || !topic) throw new Error("Topic not found.");
     const payload = topic.generated_payload as unknown as StudyPayload;
     const concept = payload.concepts.find((item) => item.key === data.conceptKey);
     if (!concept) throw new Error("Concept not found.");
     const request = data.action === "explain"
-      ? "Rewrite only the explanation in a meaningfully different, simpler way. Keep the example and recall question unchanged."
-      : "Replace only the real-life example with a different concrete example. Keep the explanation and recall question unchanged.";
-    const result = z.object({ explanation: z.string(), example: z.string() }).parse(await callStructuredAi(
-      `Return JSON with explanation and example. Lesson: ${topic.title}. Concept: ${concept.title}. Current explanation: ${concept.explanation}. Current example: ${concept.example}. ${request}`,
+      ? "Choose a different essential anchor sentence, short passage, or angle from the source material instead of merely rewording the same explanation. Build the new explanation from that new anchor only. Keep the example unchanged."
+      : "Keep the anchor and explanation unchanged. Replace only the real-life example with a different concrete example.";
+    const result = z.object({ anchor: z.string(), explanation: z.string(), example: z.string() }).parse(await callStructuredAi(
+      `Return JSON with anchor, explanation, and example. Lesson: ${topic.title}. Concept: ${concept.title}. Current anchor: ${concept.anchor ?? "Not previously recorded."}. Current explanation: ${concept.explanation}. Current example: ${concept.example}. ${request} Use very simple, everyday language, short sentences, no jargon. If a technical term is unavoidable, define it in plain words immediately after. Source material:\n\n${topic.source_text}`,
       conceptSchema,
     ));
     const updated: StudyPayload = {
