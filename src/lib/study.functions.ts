@@ -5,7 +5,7 @@ import type { StudyPayload } from "./study-types";
 
 const lessonInput = z.object({
   title: z.string().min(1).max(180),
-  sourceText: z.string().min(20).max(120000),
+  sourceText: z.string().min(20).max(400000),
 });
 
 const conceptInput = z.object({
@@ -14,9 +14,21 @@ const conceptInput = z.object({
   action: z.enum(["explain", "example"]),
 });
 
+const photoInput = z.object({
+  images: z
+    .array(z.object({ mimeType: z.string().min(3), data: z.string().min(10) }))
+    .min(1)
+    .max(20),
+});
+
+const titleInput = z.object({ sourceText: z.string().min(20).max(20000) });
+
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
+const CHUNK_LIMIT = 14000;
 
 type JsonSchema = Record<string, unknown>;
+
+type InlineImage = { mimeType: string; data: string };
 
 const lessonSchema: JsonSchema = {
   type: "object",
@@ -58,9 +70,17 @@ const conceptSchema: JsonSchema = {
   required: ["anchor", "explanation", "example"],
 };
 
-async function callStructuredAi(prompt: string, schema: JsonSchema) {
+const titleSchema: JsonSchema = {
+  type: "object",
+  properties: { title: { type: "string" } },
+  required: ["title"],
+};
+
+async function callStructuredAi(prompt: string, schema: JsonSchema, images: InlineImage[] = []) {
   const apiKey = process.env["GEMINI_API_KEY"];
   if (!apiKey) throw new Error("Gemini is not configured for this app. Add the GEMINI_API_KEY secret.");
+  const parts: Array<Record<string, unknown>> = [{ text: prompt }];
+  for (const image of images) parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
     {
@@ -70,7 +90,7 @@ async function callStructuredAi(prompt: string, schema: JsonSchema) {
         "x-goog-api-key": apiKey,
       },
       body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts }],
         generationConfig: {
           responseMimeType: "application/json",
           responseSchema: schema,
@@ -90,28 +110,98 @@ async function callStructuredAi(prompt: string, schema: JsonSchema) {
   return JSON.parse(output) as unknown;
 }
 
-function normalizePayload(value: unknown): StudyPayload {
-  const parsed = z.object({
-    summary: z.string(),
-    concepts: z.array(z.object({
-      title: z.string(), anchor: z.string(), explanation: z.string(), example: z.string(), recallQuestion: z.string(),
-    })),
-    flashcards: z.array(z.object({ front: z.string(), back: z.string() })),
-  }).parse(value);
-  if (parsed.concepts.length === 0) throw new Error("No concepts were generated.");
+const rawLesson = z.object({
+  summary: z.string(),
+  concepts: z.array(z.object({
+    title: z.string(), anchor: z.string(), explanation: z.string(), example: z.string(), recallQuestion: z.string(),
+  })),
+  flashcards: z.array(z.object({ front: z.string(), back: z.string() })),
+});
+
+type RawLesson = z.infer<typeof rawLesson>;
+
+function normalizePayload(parts: RawLesson[]): StudyPayload {
+  const concepts = parts.flatMap((part) => part.concepts);
+  const flashcards = parts.flatMap((part) => part.flashcards);
+  if (concepts.length === 0) throw new Error("No concepts were generated.");
   return {
-    summary: parsed.summary,
-    concepts: parsed.concepts.map((concept, index) => ({ ...concept, key: `concept-${index + 1}` })),
-    flashcards: parsed.flashcards.slice(0, 5).map((card, index) => ({ ...card, key: `card-${index + 1}` })),
+    summary: parts.map((part) => part.summary.trim()).filter(Boolean).join(" "),
+    concepts: concepts.map((concept, index) => ({ ...concept, key: `concept-${index + 1}` })),
+    flashcards: flashcards.slice(0, Math.max(5, Math.min(5 * parts.length, 20))).map((card, index) => ({ ...card, key: `card-${index + 1}` })),
   };
+}
+
+function splitSource(text: string) {
+  if (text.length <= CHUNK_LIMIT) return [text];
+  const blocks = text.split(/\n{2,}/);
+  const chunks: string[] = [];
+  let current = "";
+  for (const block of blocks) {
+    if (current && current.length + block.length + 2 > CHUNK_LIMIT) { chunks.push(current); current = ""; }
+    if (block.length > CHUNK_LIMIT) {
+      for (let i = 0; i < block.length; i += CHUNK_LIMIT) chunks.push(block.slice(i, i + CHUNK_LIMIT));
+      continue;
+    }
+    current = current ? `${current}\n\n${block}` : block;
+  }
+  if (current) chunks.push(current);
+  return chunks.filter((chunk) => chunk.trim().length > 0);
+}
+
+function lessonPrompt(title: string, sourceText: string, context: string, part: number, total: number) {
+  const scope = total > 1
+    ? `This is part ${part} of ${total} of one longer material. Previous parts already covered: ${context || "nothing yet"}. Do not repeat concepts already covered; only cover what is new in this part. Generate 2 to 4 flashcards for this part.`
+    : "Generate 3 to 5 flashcards.";
+  return `Return JSON for a study lesson titled "${title}". The JSON must have summary (string), concepts (array of individual sub-topics with title, anchor, explanation, one real-life example, recallQuestion), and flashcards (array with front and back). For each concept, first identify the single most essential sentence or short passage from the source material—the core definition or key example—and return it as anchor. Build that concept's explanation from that anchor point only, not from the full surrounding paragraph. If the source has multiple numbered sub-points under a heading (for example, "1. Technological Advancements" and "2. Market Competition"), return every numbered sub-point as its own separate concept; never merge them into one concept. Use very simple, everyday language, short sentences, no jargon. If a technical term is unavoidable, define it in plain words immediately after. ${scope} Do not rewrite the source as one long summary. Source:\n\n${sourceText}`;
 }
 
 export const generateStudyMaterial = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => lessonInput.parse(input))
   .handler(async ({ data }) => {
-    const prompt = `Return JSON for a study lesson titled "${data.title}". The JSON must have summary (string), concepts (array of individual sub-topics with title, anchor, explanation, one real-life example, recallQuestion), and flashcards (array with front and back). For each concept, first identify the single most essential sentence or short passage from the source material—the core definition or key example—and return it as anchor. Build that concept's explanation from that anchor point only, not from the full surrounding paragraph. If the source has multiple numbered sub-points under a heading (for example, "1. Technological Advancements" and "2. Market Competition"), return every numbered sub-point as its own separate concept; never merge them into one concept. Use very simple, everyday language, short sentences, no jargon. If a technical term is unavoidable, define it in plain words immediately after. Generate 3 to 5 flashcards. Do not rewrite the source as one long summary. Source:\n\n${data.sourceText}`;
-    return normalizePayload(await callStructuredAi(prompt, lessonSchema));
+    const chunks = splitSource(data.sourceText);
+    const parts: RawLesson[] = [];
+    let context = "";
+    for (let index = 0; index < chunks.length; index++) {
+      const raw = rawLesson.parse(
+        await callStructuredAi(lessonPrompt(data.title, chunks[index]!, context, index + 1, chunks.length), lessonSchema),
+      );
+      parts.push(raw);
+      context = `${context} ${raw.summary} Concepts: ${raw.concepts.map((c) => c.title).join(", ")}.`.trim().slice(-2000);
+    }
+    return normalizePayload(parts);
+  });
+
+export const extractPhotoText = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => photoInput.parse(input))
+  .handler(async ({ data }) => {
+    const pages: string[] = [];
+    for (const image of data.images) {
+      const result = z.object({ text: z.string() }).parse(
+        await callStructuredAi(
+          "Read all text in this image exactly as written and return JSON with a single field text. Preserve line and paragraph breaks and numbered lists. If the image contains no readable text, return an empty string.",
+          { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+          [image],
+        ),
+      );
+      if (result.text.trim()) pages.push(result.text.trim());
+    }
+    if (pages.length === 0) throw new Error("No readable text was found in those photos.");
+    return { text: pages.join("\n\n") };
+  });
+
+export const suggestTopicTitle = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => titleInput.parse(input))
+  .handler(async ({ data }) => {
+    const result = z.object({ title: z.string() }).parse(
+      await callStructuredAi(
+        `Return JSON with a single field title: a short topic name (2 to 6 words, no quotes) for this study material.\n\n${data.sourceText}`,
+        titleSchema,
+      ),
+    );
+    return { title: result.title.slice(0, 180) };
   });
 
 export const regenerateConcept = createServerFn({ method: "POST" })
@@ -128,7 +218,7 @@ export const regenerateConcept = createServerFn({ method: "POST" })
       ? "Choose a different essential anchor sentence, short passage, or angle from the source material instead of merely rewording the same explanation. Build the new explanation from that new anchor only. Keep the example unchanged."
       : "Keep the anchor and explanation unchanged. Replace only the real-life example with a different concrete example.";
     const result = z.object({ anchor: z.string(), explanation: z.string(), example: z.string() }).parse(await callStructuredAi(
-      `Return JSON with anchor, explanation, and example. Lesson: ${topic.title}. Concept: ${concept.title}. Current anchor: ${concept.anchor ?? "Not previously recorded."}. Current explanation: ${concept.explanation}. Current example: ${concept.example}. ${request} Use very simple, everyday language, short sentences, no jargon. If a technical term is unavoidable, define it in plain words immediately after. Source material:\n\n${topic.source_text}`,
+      `Return JSON with anchor, explanation, and example. Lesson: ${topic.title}. Concept: ${concept.title}. Current anchor: ${concept.anchor ?? "Not previously recorded."}. Current explanation: ${concept.explanation}. Current example: ${concept.example}. ${request} Use very simple, everyday language, short sentences, no jargon. If a technical term is unavoidable, define it in plain words immediately after. Source material:\n\n${topic.source_text.slice(0, 40000)}`,
       conceptSchema,
     ));
     const updated: StudyPayload = {
