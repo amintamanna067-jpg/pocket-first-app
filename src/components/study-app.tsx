@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { BookOpen, ChevronDown, ChevronRight, Cloud, CloudOff, FileText, Folder, FolderPlus, GraduationCap, LogOut, Menu, MoreVertical, Plus, RefreshCw, Sparkles } from "lucide-react";
+import { BookOpen, ChevronDown, ChevronRight, Cloud, CloudOff, FileText, Folder, FolderPlus, GraduationCap, Image, LogOut, Menu, MoreVertical, Paperclip, Plus, RefreshCw, Sparkles, Type } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
-import { generateStudyMaterial, regenerateConcept } from "@/lib/study.functions";
+import { extractPhotoText, generateStudyMaterial, regenerateConcept, suggestTopicTitle } from "@/lib/study.functions";
+
 import { cacheTopic, listCachedTopics, readCachedTopic } from "@/lib/offline-cache";
 import type { StudyPayload, StudyTopic } from "@/lib/study-types";
 import { Button } from "@/components/ui/button";
